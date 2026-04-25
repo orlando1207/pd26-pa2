@@ -5,6 +5,7 @@
 #include <vector>
 #include <map>
 #include <string>
+#include <ctime>
 #include "module.h"
 #include "btree.h"
 
@@ -19,12 +20,15 @@ public:
 private:
     void parseBlock(fstream& input);
     void parseNet(fstream& input);
-    double getCost();
     double calcTotalHPWL();
+    double getCost();
     void perturb();
+    double autoTuneTemperature();
     void simulatedAnnealing();
 
     double _alpha;
+    double _timeLimitSec;
+    clock_t _startClock;
     int _outlineW, _outlineH;
 
     vector<Block*> _blocks;
@@ -40,6 +44,11 @@ private:
     vector<BTreeNode> _bestNodes;
     int _bestRoot;
     vector<bool> _bestRotate;
+
+    // SA adaptive state
+    double _normArea;    // avg area used to normalise cost
+    double _normWL;      // avg wirelength used to normalise cost
+    double _tempRatio;   // current T / T0  (1.0 = hot, 0.0 = cold)
 };
 
 #endif

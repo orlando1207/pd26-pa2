@@ -4,3 +4,7 @@
 *.o
 *.rpt
 /fp
+/outputs
+fp_asan
+result.txt
+run.sh

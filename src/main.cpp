@@ -2,6 +2,7 @@
 #include <fstream>
 #include <cstdlib>
 #include <ctime>
+#include <chrono>
 #include "floorplanner.h"
 using namespace std;
 
@@ -23,12 +24,13 @@ int main(int argc, char** argv)
     if (!netFile) { cerr << "Cannot open " << argv[3] << endl; return 1; }
     if (!output)  { cerr << "Cannot open " << argv[4] << endl; return 1; }
 
-    clock_t start = clock();
+    auto wallStart = chrono::steady_clock::now();
 
     Floorplanner* fp = new Floorplanner(blkFile, netFile, alpha);
     fp->floorplan();
 
-    double runtime = (double)(clock() - start) / CLOCKS_PER_SEC;
+    double runtime = chrono::duration<double>(
+        chrono::steady_clock::now() - wallStart).count();
     fp->writeResult(output, runtime);
 
     delete fp;

@@ -11,11 +11,13 @@
 using namespace std;
 
 Floorplanner::Floorplanner(fstream& blkFile, fstream& netFile, double alpha)
-    : _alpha(alpha), _bestW(0), _bestH(0), _bestCost(DBL_MAX), _bestRoot(-1)
+    : _alpha(alpha), _timeLimitSec(3600.0), _startClock(0),
+      _bestW(0), _bestH(0), _bestCost(DBL_MAX), _bestRoot(-1),
+      _normArea(1.0), _normWL(1.0), _tempRatio(1.0)
 {
     parseBlock(blkFile);
     parseNet(netFile);
-    _tree.init(_blocks.size());
+    _tree.randomly_init(_blocks.size());
 }
 
 Floorplanner::~Floorplanner() {
@@ -83,19 +85,33 @@ double Floorplanner::getCost() {
     double area = (double)totalW * totalH;
     double wl = calcTotalHPWL();
 
-    // Penalty for exceeding outline
+    // ── 1. Normalise area and wirelength to the same scale ──────────────
+    double normA  = area / _normArea;
+    double normWL = wl   / _normWL;
+
+    // ── 2. Dynamic penalty: loose at high T (explore), tight at low T ──
+    //   penaltyCoeff: 1.0 when _tempRatio=1 (hot) → 50.0 when _tempRatio=0 (cold)
+    double penaltyCoeff = 1.0 + 49.0 * (1.0 - _tempRatio);
     double penalty = 0;
     if (totalW > _outlineW)
-        penalty += (totalW - _outlineW) * (_outlineH + totalH);
+        penalty += (double)(totalW - _outlineW) * (_outlineH + totalH);
     if (totalH > _outlineH)
-        penalty += (totalH - _outlineH) * (_outlineW + totalW);
+        penalty += (double)(totalH - _outlineH) * (_outlineW + totalW);
 
-    return _alpha * area + (1.0 - _alpha) * wl + 10.0 * penalty;
+    return _alpha * normA + (1.0 - _alpha) * normWL
+           + penaltyCoeff * (penalty / _normArea);
 }
 
 void Floorplanner::perturb() {
     int n = _blocks.size();
-    int op = rand() % 3;
+
+    // ── Adaptive perturbation weights ────────────────────────────────────
+    // rotateP: 10 % at high T  →  40 % at low T  (fine-tuning)
+    // The remaining probability is split evenly between delete-insert and swap.
+    double rotateP = 0.10 + 0.30 * (1.0 - _tempRatio);
+    double moveP   = (1.0 - rotateP) * 0.5;
+    double r = (double)rand() / RAND_MAX;
+    int op = (r < rotateP) ? 0 : (r < rotateP + moveP) ? 1 : 2;
 
     if (op == 0) {
         // Rotate a block
@@ -118,68 +134,141 @@ void Floorplanner::perturb() {
     }
 }
 
-void Floorplanner::simulatedAnnealing() {
+double Floorplanner::autoTuneTemperature() {
     int n = _blocks.size();
-    double T = 1e6;
+    int samples = max(200, 10 * n);
+
+    // Snapshot starting state (shared by both phases below)
+    vector<BTreeNode> snapNodes(n);
+    int snapRoot;
+    _tree.saveState(snapNodes, snapRoot);
+    vector<bool> snapRotate(n);
+    for (int i = 0; i < n; i++) snapRotate[i] = _blocks[i]->getRotate();
+
+    // Pre-allocate inner-loop buffers
+    vector<BTreeNode> tmpNodes(n);
+    int tmpRoot;
+    vector<bool> tmpRotate(n);
+
+    // ── Phase 1: estimate normalization factors ──────────────────────────
+    // Sample raw area and wirelength to establish each term's typical scale.
+    // _tempRatio is still 1.0 here, so perturb() uses high-T weights.
+    int normSamples = max(50, samples / 4);
+    double sumArea = 0, sumWL = 0;
+    for (int i = 0; i < normSamples; i++) {
+        _tree.saveState(tmpNodes, tmpRoot);
+        for (int j = 0; j < n; j++) tmpRotate[j] = _blocks[j]->getRotate();
+
+        perturb();
+        int tw, th;
+        _tree.pack(_blocks, tw, th);
+        sumArea += (double)tw * th;
+        sumWL   += calcTotalHPWL();
+
+        _tree.restore(tmpNodes, tmpRoot);
+        for (int j = 0; j < n; j++) _blocks[j]->setRotate(tmpRotate[j]);
+    }
+    _normArea = sumArea / normSamples;
+    _normWL   = sumWL   / normSamples;
+    if (_normArea < 1.0) _normArea = 1.0;
+    if (_normWL   < 1.0) _normWL   = 1.0;
+
+    // ── Phase 2: estimate T0 using the now-calibrated normalised costs ───
+    double baseCost = getCost();
+    double sumAbsDelta = 0;
+
+    for (int i = 0; i < samples; i++) {
+        _tree.saveState(tmpNodes, tmpRoot);
+        for (int j = 0; j < n; j++) tmpRotate[j] = _blocks[j]->getRotate();
+
+        perturb();
+        double newCost = getCost();
+        sumAbsDelta += fabs(newCost - baseCost);
+
+        _tree.restore(tmpNodes, tmpRoot);
+        for (int j = 0; j < n; j++) _blocks[j]->setRotate(tmpRotate[j]);
+    }
+
+    // Restore starting state
+    _tree.restore(snapNodes, snapRoot);
+    for (int i = 0; i < n; i++) _blocks[i]->setRotate(snapRotate[i]);
+
+    double avgDelta = sumAbsDelta / samples;
+    if (avgDelta < 1e-9) avgDelta = 1e-9;
+    // T0 s.t. P(accept bad move) ~= 0.8: T0 = -avgDelta / ln(0.8) = avgDelta / 0.2231
+    return avgDelta / 0.2231;
+}
+
+void Floorplanner::simulatedAnnealing() {
+    _startClock = clock();
+    int n = _blocks.size();
+
+    // Auto-tune initial temperature from cost landscape
+    double T = autoTuneTemperature();
+    double T0 = T;          // stored for _tempRatio computation
+    _tempRatio = 1.0;
     double coolingRate = 0.999;
-    double Tmin = 0.01;
+    // Tmin: SA terminates naturally when acceptance probability is negligible.
+    // Chosen so that at Tmin the acceptance prob for a 1-sigma bad move is < 1e-4.
+    double Tmin = T0 * 1e-4;
+    if (Tmin < 1e-12) Tmin = 1e-12;
     int iterPerTemp = max(10 * n, 200);
 
     double curCost = getCost();
+    int curW = _tree.getLastW(), curH = _tree.getLastH();
 
-    // Save initial as best
-    {
-        int tw, th;
-        _tree.pack(_blocks, tw, th);
-        _bestCost = curCost;
-        _bestW = tw; _bestH = th;
-        _bestNodes = _tree.saveNodes();
-        _bestRoot = _tree.saveRoot();
-        _bestRotate.resize(n);
-        for (int i = 0; i < n; i++)
-            _bestRotate[i] = _blocks[i]->getRotate();
-    }
+    // Save initial state as best (even if infeasible)
+    _bestCost = curCost;
+    _bestW = curW; _bestH = curH;
+    _bestNodes.resize(n);
+    _tree.saveState(_bestNodes, _bestRoot);
+    _bestRotate.resize(n);
+    for (int i = 0; i < n; i++) _bestRotate[i] = _blocks[i]->getRotate();
+
+    // Pre-allocate saved-state buffers once (no per-iteration heap allocation)
+    vector<BTreeNode> savedNodes(n);
+    int savedRoot;
+    vector<bool> savedRotate(n);
 
     while (T > Tmin) {
+        _tempRatio = T / T0;
         for (int i = 0; i < iterPerTemp; i++) {
-            // Save state
-            auto savedNodes = _tree.saveNodes();
-            int savedRoot = _tree.saveRoot();
-            vector<bool> savedRotate(n);
-            for (int j = 0; j < n; j++)
-                savedRotate[j] = _blocks[j]->getRotate();
+            // Save current state into pre-allocated buffers
+            _tree.saveState(savedNodes, savedRoot);
+            for (int j = 0; j < n; j++) savedRotate[j] = _blocks[j]->getRotate();
 
             perturb();
             double newCost = getCost();
+            // Retrieve W/H from the pack() already called inside getCost()
+            int ntw = _tree.getLastW(), nth = _tree.getLastH();
             double delta = newCost - curCost;
 
             if (delta < 0 || (double)rand() / RAND_MAX < exp(-delta / T)) {
                 curCost = newCost;
-                // Check if this is the best feasible solution
-                int tw, th;
-                _tree.pack(_blocks, tw, th);
-                if (tw <= _outlineW && th <= _outlineH && newCost < _bestCost) {
+                curW = ntw; curH = nth;
+                // Update best only for feasible solutions
+                if (ntw <= _outlineW && nth <= _outlineH && newCost < _bestCost) {
                     _bestCost = newCost;
-                    _bestW = tw; _bestH = th;
-                    _bestNodes = _tree.saveNodes();
-                    _bestRoot = _tree.saveRoot();
-                    for (int j = 0; j < n; j++)
-                        _bestRotate[j] = _blocks[j]->getRotate();
+                    _bestW = ntw; _bestH = nth;
+                    _tree.saveState(_bestNodes, _bestRoot);
+                    for (int j = 0; j < n; j++) _bestRotate[j] = _blocks[j]->getRotate();
                 }
             } else {
-                // Reject: restore
+                // Reject: restore from pre-allocated buffers
                 _tree.restore(savedNodes, savedRoot);
-                for (int j = 0; j < n; j++)
-                    _blocks[j]->setRotate(savedRotate[j]);
+                for (int j = 0; j < n; j++) _blocks[j]->setRotate(savedRotate[j]);
             }
         }
-        T *= coolingRate;
+        if (T > 1e-12) T *= coolingRate;
+
+        // Hard 3600 s safety cutoff
+        double elapsed = (double)(clock() - _startClock) / CLOCKS_PER_SEC;
+        if (elapsed >= _timeLimitSec) break;
     }
 
-    // Restore best
+    // Restore best found solution
     _tree.restore(_bestNodes, _bestRoot);
-    for (int i = 0; i < n; i++)
-        _blocks[i]->setRotate(_bestRotate[i]);
+    for (int i = 0; i < n; i++) _blocks[i]->setRotate(_bestRotate[i]);
     int tw, th;
     _tree.pack(_blocks, tw, th);
     _bestW = tw; _bestH = th;
